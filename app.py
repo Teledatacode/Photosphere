@@ -5,8 +5,10 @@ import base64
 from io import BytesIO
 from PIL import Image
 import os
+from flask_cors import CORS  # <-- Importa flask_cors
 
 app = Flask(__name__)
+CORS(app)  # <-- Habilita CORS para todas las rutas y orígenes
 
 def base64_to_cv2image(b64):
     try:
