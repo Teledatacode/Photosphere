@@ -29,10 +29,7 @@ def cv2image_to_base64(img):
 
 
 def close_panorama(image, blend_ratio=0.02):
-    """
-    Une suavemente los bordes izquierdo y derecho de una imagen panorámica equirectangular.
-    blend_ratio define el ancho de mezcla en proporción al ancho total (por defecto 2%).
-    """
+    """Une suavemente los bordes izquierdo y derecho de una imagen panorámica equirectangular."""
     if image is None or image.size == 0:
         return image
 
@@ -42,10 +39,7 @@ def close_panorama(image, blend_ratio=0.02):
     left = image[:, :blend_width].astype(np.float32)
     right = image[:, -blend_width:].astype(np.float32)
 
-    # Gradiente alfa de 0 → 1
     alpha = np.linspace(0, 1, blend_width).reshape(1, -1, 1)
-
-    # Mezcla bidireccional
     blended_left = left * (1 - alpha) + right * alpha
     blended_right = right * (1 - alpha) + left * alpha
 
@@ -54,6 +48,38 @@ def close_panorama(image, blend_ratio=0.02):
     result[:, -blend_width:] = blended_right
 
     return result.astype(np.uint8)
+
+
+def preprocess_image(img, max_size=1600):
+    """
+    Mejora la estabilidad del stitching:
+    - Reduce resolución si es muy grande.
+    - Aplica equalización de histograma para mejorar contraste.
+    - Descarta imágenes con poca textura (muy planas).
+    """
+    if img is None:
+        return None
+
+    # Reducción adaptativa si la imagen es muy grande
+    h, w = img.shape[:2]
+    scale = min(1.0, max_size / max(h, w))
+    if scale < 1.0:
+        img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+
+    # Convertir a gris para análisis de textura
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # Medir nivel de detalle
+    contrast = np.std(gray)
+    if contrast < 10:  # umbral bajo → imagen muy plana
+        print("Descartando imagen por baja textura (σ =", contrast, ")")
+        return None
+
+    # Equalización de histograma (solo para detección de features, no afecta color)
+    gray_eq = cv2.equalizeHist(gray)
+    img_eq = cv2.cvtColor(gray_eq, cv2.COLOR_GRAY2BGR)
+
+    return img_eq
 
 
 @app.route("/upload", methods=["POST"])
@@ -65,28 +91,30 @@ def upload():
     images = []
     for item in data["photos"]:
         img = base64_to_cv2image(item["photo"])
-        if img is not None:
-            images.append(img)
+        processed = preprocess_image(img)
+        if processed is not None:
+            images.append(processed)
 
     if len(images) < 2:
         return jsonify({"error": "Need at least 2 valid images for stitching"}), 400
 
-    stitcher = cv2.Stitcher_create()
+    # Usa el modo PANORAMA explícitamente (más tolerante)
+    stitcher = cv2.Stitcher_create(cv2.Stitcher_PANORAMA)
     status, stitched = stitcher.stitch(images)
 
     if status != cv2.Stitcher_OK:
+        print("Error en el stitching:", status)
         return jsonify({"error": f"Stitching failed (code {status})"}), 500
 
-    # 🔄 Une los bordes izquierdo y derecho para eliminar la línea vertical
     stitched = close_panorama(stitched)
-
     result_b64 = cv2image_to_base64(stitched)
+
     return jsonify({"image": result_b64})
 
 
 @app.route("/", methods=["GET"])
 def index():
-    return "Stitching backend is running."
+    return "Stitching backend is running (optimized version)."
 
 
 if __name__ == "__main__":
