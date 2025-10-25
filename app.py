@@ -8,14 +8,11 @@ import os
 from flask_cors import CORS
 
 app = Flask(__name__)
+CORS(app)  # Permite CORS para todas las rutas
 
-# Habilita CORS completamente (esto evita "failed to fetch" por origen)
-CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
-
-
-# ------------------------------
-# 🔹 Funciones auxiliares
-# ------------------------------
+# ---------------------------
+# Funciones auxiliares
+# ---------------------------
 def base64_to_cv2image(b64):
     try:
         header, encoded = b64.split(',', 1)
@@ -26,20 +23,46 @@ def base64_to_cv2image(b64):
         print("❌ Error decoding base64:", e)
         return None
 
-
 def cv2image_to_base64(img):
     _, buffer = cv2.imencode('.jpg', img)
     b64 = base64.b64encode(buffer).decode('utf-8')
     return "data:image/jpeg;base64," + b64
 
+# Stitching incremental por bloques
+def stitch_images_incremental(images, block_size=6):
+    # Paso 1: dividir en bloques
+    partials = []
+    for i in range(0, len(images), block_size):
+        block = images[i:i+block_size]
+        stitcher = cv2.Stitcher_create(cv2.Stitcher_PANORAMA)
+        stitcher.setPanoConfidenceThresh(0.5)
+        status, stitched = stitcher.stitch(block)
+        if status != cv2.Stitcher_OK:
+            print(f"⚠️ Stitching de bloque {i//block_size} falló con código {status}")
+            continue
+        partials.append(stitched)
 
-# ------------------------------
-# 🔹 Ruta principal de stitching
-# ------------------------------
+    if len(partials) == 0:
+        return None  # Ningún bloque funcionó
+
+    # Paso 2: unir los panoramas parciales
+    final = partials[0]
+    for part in partials[1:]:
+        stitcher = cv2.Stitcher_create(cv2.Stitcher_PANORAMA)
+        stitcher.setPanoConfidenceThresh(0.5)
+        status, stitched = stitcher.stitch([final, part])
+        if status != cv2.Stitcher_OK:
+            print(f"⚠️ Stitching parcial falló con código {status}, usando parcial previo")
+            continue
+        final = stitched
+
+    return final
+
+# ---------------------------
+# Ruta principal de stitching
+# ---------------------------
 @app.route("/upload", methods=["POST"])
 def upload():
-    print("📥 Petición recibida en /upload")
-
     try:
         data = request.get_json()
         if not data or "photos" not in data:
@@ -54,45 +77,32 @@ def upload():
                 print(f"⚠️ Imagen {i} inválida")
 
         if len(images) < 2:
-            return jsonify({"error": "Need at least 2 valid images for stitching"}), 400
+            return jsonify({"error": "Need at least 2 valid images"}), 400
 
-        # 🔧 Crear stitcher (modo panorámico, mejor compatibilidad)
-        stitcher = cv2.Stitcher_create(cv2.Stitcher_PANORAMA)
-        stitcher.setPanoConfidenceThresh(0.5)
+        print(f"🧵 Procesando {len(images)} imágenes con stitching incremental...")
+        stitched_final = stitch_images_incremental(images, block_size=6)
 
-        print("🧵 Iniciando stitching con", len(images), "imágenes...")
-        status, stitched = stitcher.stitch(images)
-
-        if status != cv2.Stitcher_OK:
-            print(f"❌ Error en stitching: código {status}")
-            return jsonify({"error": f"Stitching failed (code {status})"}), 500
+        if stitched_final is None:
+            return jsonify({"error": "Stitching incremental falló"}), 500
 
         print("✅ Stitching completado correctamente")
-
-        # 🔄 Corregir posible hueco entre bordes horizontales (wrap-around)
-        height, width = stitched.shape[:2]
-        border = int(width * 0.002)
-        stitched[:, :border] = stitched[:, -border:]
-
-        result_b64 = cv2image_to_base64(stitched)
+        result_b64 = cv2image_to_base64(stitched_final)
         return jsonify({"image": result_b64})
 
     except Exception as e:
         print("🔥 Error general:", e)
         return jsonify({"error": str(e)}), 500
 
-
-# ------------------------------
-# 🔹 Ruta base (ping)
-# ------------------------------
+# ---------------------------
+# Ruta de prueba
+# ---------------------------
 @app.route("/", methods=["GET"])
 def index():
-    return "Stitching backend is running."
+    return "Stitching backend incremental running."
 
-
-# ------------------------------
-# 🔹 Main
-# ------------------------------
+# ---------------------------
+# Main
+# ---------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
