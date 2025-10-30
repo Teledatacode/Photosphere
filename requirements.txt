@@ -3,3 +3,5 @@ Flask-Cors
 opencv-python-headless
 numpy
 Pillow
+requests
+
