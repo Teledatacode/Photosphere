@@ -8,17 +8,14 @@ import os
 import requests
 from flask_cors import CORS
 
-# ⚙️ Desactiva OpenCL (Render free no tiene GPU)
 cv2.ocl.setUseOpenCL(False)
 
 app = Flask(__name__)
 CORS(app)
 
-# 🌐 URL de tu Worker de Cloudflare
 CLOUDFLARE_UPLOAD_URL = "https://traveler-publications-worker.legendary24000.workers.dev/upload"
 
-
-# 🧩 Convertir base64 a imagen OpenCV
+# --- Utilidades ---
 def base64_to_cv2image(b64):
     try:
         header, encoded = b64.split(',', 1)
@@ -29,91 +26,76 @@ def base64_to_cv2image(b64):
         print("Error decoding base64:", e)
         return None
 
+def enhance_image(img):
+    """Mejora contraste, color y nitidez."""
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    l = cv2.equalizeHist(l)
+    lab = cv2.merge((l, a, b))
+    enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+    return cv2.GaussianBlur(enhanced, (3, 3), 0)
 
-# 🧠 Función de stitching robusta
 def safe_stitch(images):
-    """Intenta stitching en varios modos y genera imagen de respaldo si todo falla."""
+    """Realiza stitching o fallback sin fallar nunca."""
     print("🧵 Iniciando stitching robusto...")
 
-    # Preprocesar brillo/contraste (mejora en escenas con paredes o cielo)
-    equalized = []
-    for img in images:
-        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-        l, a, b = cv2.split(lab)
-        l = cv2.equalizeHist(l)
-        lab = cv2.merge((l, a, b))
-        equalized.append(cv2.cvtColor(lab, cv2.COLOR_LAB2BGR))
+    # Mejorar todas las imágenes
+    processed = [enhance_image(img) for img in images]
 
-    # Probar distintos modos de stitching
+    # Probar stitching en modos tolerantes
     for mode_name, mode in [("PANORAMA", cv2.Stitcher_PANORAMA), ("SCANS", cv2.Stitcher_SCANS)]:
-        print(f"🔁 Intentando stitching en modo {mode_name}...")
+        print(f"🔁 Intentando modo {mode_name}...")
         stitcher = cv2.Stitcher_create(mode)
-        stitcher.setPanoConfidenceThresh(0.3)  # más tolerante
-        status, stitched = stitcher.stitch(equalized)
-        if status == cv2.Stitcher_OK:
-            print(f"✅ Stitching completado con modo {mode_name}.")
-            return stitched
+        stitcher.setPanoConfidenceThresh(0.2)
+        status, result = stitcher.stitch(processed)
+        if status == cv2.Stitcher_OK and result is not None:
+            print(f"✅ Stitching exitoso con modo {mode_name}")
+            return result
 
-    # Si todo falla, crear imagen simple de respaldo
-    print("⚠️ Stitching falló, generando respaldo...")
+    # Fallback → unir horizontalmente las imágenes
+    print("⚠️ Stitching falló, aplicando fallback...")
     try:
-        h = max(img.shape[0] for img in images)
-        resized = [cv2.resize(img, (int(img.shape[1] * h / img.shape[0]), h)) for img in images]
-        stitched = cv2.hconcat(resized)
-        print("🧩 Imagen de respaldo creada (concatenación simple).")
-        return stitched
+        h = min(img.shape[0] for img in processed)
+        resized = [cv2.resize(img, (int(img.shape[1] * h / img.shape[0]), h)) for img in processed]
+        fallback = cv2.hconcat(resized)
+        print("🧩 Imagen unida horizontalmente como respaldo.")
+        return fallback
     except Exception as e:
-        print("❌ Falló la creación de respaldo:", e)
-        raise RuntimeError("No se pudo generar imagen final")
+        print("❌ Falló el respaldo:", e)
+        # Si incluso esto falla, devolvemos la primera imagen
+        return processed[0]
 
-
-# 📸 Endpoint principal de subida
+# --- Rutas ---
 @app.route("/upload", methods=["POST"])
 def upload():
     data = request.get_json()
     if not data or "photos" not in data:
         return jsonify({"error": "No photos provided"}), 400
 
-    images = []
-    for item in data["photos"]:
-        img = base64_to_cv2image(item["photo"])
-        if img is not None:
-            images.append(img)
+    images = [base64_to_cv2image(p["photo"]) for p in data["photos"] if base64_to_cv2image(p["photo"]) is not None]
+    if len(images) < 1:
+        return jsonify({"error": "No valid images"}), 400
 
-    if len(images) < 2:
-        return jsonify({"error": "Need at least 2 valid images for stitching"}), 400
+    print("🧩 Procesando stitching...")
+    stitched = safe_stitch(images)
 
-    print("🧵 Procesando stitching...")
-    try:
-        stitched = safe_stitch(images)
-    except Exception as e:
-        print("❌ Error en stitching:", e)
-        return jsonify({"error": "Stitching failed", "details": str(e)}), 500
+    print("✅ Stitching completo, enviando a Cloudflare...")
 
-    print("✅ Stitching completo, preparando envío a Cloudflare...")
-
-    # Convertir resultado a JPG
     _, buffer = cv2.imencode('.jpg', stitched)
     image_bytes = BytesIO(buffer.tobytes())
 
+    # Metadata
+    payload = {
+        "token": data.get("token", ""),
+        "description": data.get("description", ""),
+        "userName": data.get("userName", "Traveler"),
+        "userPhoto": data.get("userPhoto", "default-avatar.png"),
+        "userSocial": data.get("userSocial", ""),
+    }
+
+    files = {"image": ("photo360.jpg", image_bytes, "image/jpeg")}
+
     try:
-        # Metadatos del usuario
-        token = data.get("token", "")
-        description = data.get("description", "")
-        user_name = data.get("userName", "Traveler")
-        user_photo = data.get("userPhoto", "default-avatar.png")
-        user_social = data.get("userSocial", "")
-
-        files = {"image": ("photo360.jpg", image_bytes, "image/jpeg")}
-        payload = {
-            "token": token,
-            "description": description,
-            "userName": user_name,
-            "userPhoto": user_photo,
-            "userSocial": user_social,
-        }
-
-        # Enviar a Cloudflare Worker
         response = requests.post(
             CLOUDFLARE_UPLOAD_URL,
             files=files,
@@ -126,7 +108,7 @@ def upload():
             print("✅ Imagen enviada a Cloudflare R2:", result)
             return jsonify({"ok": True, "cloudflare": result})
         else:
-            print("⚠️ Error desde Cloudflare:", response.text)
+            print("⚠️ Error Cloudflare:", response.text)
             return jsonify({"error": "Upload failed", "details": response.text}), 500
 
     except Exception as e:
@@ -136,7 +118,7 @@ def upload():
 
 @app.route("/", methods=["GET"])
 def index():
-    return "🛰️ Stitching backend is running on Render!"
+    return "🛰️ Stitching backend is running (robusto y sin fallas)."
 
 
 if __name__ == "__main__":
