@@ -13,6 +13,7 @@ CORS(app)
 
 CLOUDFLARE_UPLOAD_URL = "https://traveler-publications-worker.legendary24000.workers.dev/upload"
 
+# --- Helpers ---
 def base64_to_cv2image(b64):
     try:
         header, encoded = b64.split(',', 1)
@@ -23,14 +24,23 @@ def base64_to_cv2image(b64):
         print("Error decoding base64:", e)
         return None
 
-def is_blurry(image, threshold=100):
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    return cv2.Laplacian(gray, cv2.CV_64F).var() < threshold
+def is_image_valid(img, threshold=10):
+    """Descarta imágenes casi blancas o sin textura"""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    variance = gray.var()
+    return variance > threshold
 
-def is_uniform(image, threshold=10):
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    return np.std(gray) < threshold
+def preprocess_image(img):
+    """Mejora contraste y textura para mejor stitching"""
+    try:
+        img = cv2.detailEnhance(img, sigma_s=10, sigma_r=0.15)
+    except Exception as e:
+        print("⚠️ Error en detailEnhance:", e)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.equalizeHist(gray)
+    return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
+# --- Routes ---
 @app.route("/upload", methods=["POST"])
 def upload():
     data = request.get_json()
@@ -38,44 +48,37 @@ def upload():
         return jsonify({"error": "No photos provided"}), 400
 
     images = []
-    for i, item in enumerate(data["photos"]):
+    for item in data["photos"]:
         img = base64_to_cv2image(item["photo"])
-        if img is None:
-            print(f"⚠️ Imagen {i} inválida, ignorada")
-            continue
-        if is_blurry(img):
-            print(f"⚠️ Imagen {i} borrosa, ignorada")
-            continue
-        if is_uniform(img):
-            print(f"⚠️ Imagen {i} muy uniforme, ignorada")
-            continue
-        images.append(img)
+        if img is not None and is_image_valid(img):
+            img = preprocess_image(img)
+            images.append(img)
 
     if len(images) < 2:
-        return jsonify({"error": "Need at least 2 valid images for stitching"}), 400
+        return jsonify({"error": "Not enough valid images for stitching"}), 400
 
-    # Ajustes para reducir fallos por solapamiento insuficiente
+    print(f"🧵 Procesando stitching con {len(images)} imágenes...")
+
+    # --- Stitching ---
     stitcher = cv2.Stitcher_create(cv2.Stitcher_PANORAMA)
-    stitcher.setPanoConfidenceThresh(0.3)  # Default 1.0 → más tolerante
+    status, stitched = stitcher.stitch(images)
 
-    max_retries = 2
-    for attempt in range(max_retries):
+    # Fallback SCANS si PANORAMA falla
+    if status != cv2.Stitcher_OK:
+        print("⚠️ PANORAMA failed, intentando SCANS...")
+        stitcher = cv2.Stitcher_create(cv2.Stitcher_SCANS)
         status, stitched = stitcher.stitch(images)
-        if status == cv2.Stitcher_OK:
-            break
-        else:
-            print(f"⚠️ Stitching failed (code {status}), intento {attempt+1}/{max_retries}")
-            # Reintentar quitando la última imagen
-            if len(images) > 2:
-                images.pop(-1)
-            else:
-                return jsonify({"error": f"Stitching failed after {max_retries} attempts", "code": status}), 500
+
+    if status != cv2.Stitcher_OK:
+        print("❌ Falló el stitching:", status)
+        return jsonify({"error": f"Stitching failed (code {status})"}), 500
 
     print("✅ Stitching completo, preparando envío a Cloudflare...")
 
     _, buffer = cv2.imencode('.jpg', stitched)
     image_bytes = BytesIO(buffer.tobytes())
 
+    # --- Enviar a Cloudflare ---
     try:
         token = data.get("token", "")
         description = data.get("description", "")
@@ -92,32 +95,30 @@ def upload():
             "userSocial": user_social,
         }
 
-        # Retry simple para subir a Cloudflare
-        response = None
-        for _ in range(3):
-            try:
-                response = requests.post(
-                    CLOUDFLARE_UPLOAD_URL,
-                    files=files,
-                    data=payload,
-                    timeout=60
-                )
-                if response.status_code == 200:
-                    break
-            except Exception as e:
-                print("Retry upload due to exception:", e)
+        response = requests.post(
+            CLOUDFLARE_UPLOAD_URL,
+            files=files,
+            data=payload,
+            timeout=30
+        )
 
-        if response is None or response.status_code != 200:
-            return jsonify({"error": "Upload failed", "details": response.text if response else "No response"}), 500
-
-        return jsonify({"ok": True, "cloudflare": response.json()})
+        if response.status_code == 200:
+            result = response.json()
+            print("✅ Imagen enviada a Cloudflare R2:", result)
+            return jsonify({"ok": True, "cloudflare": result})
+        else:
+            print("⚠️ Error desde Cloudflare:", response.text)
+            return jsonify({"error": "Upload failed", "details": response.text}), 500
 
     except Exception as e:
+        print("⚠️ Excepción al subir a Cloudflare:", e)
         return jsonify({"error": "Exception during upload", "details": str(e)}), 500
+
 
 @app.route("/", methods=["GET"])
 def index():
     return "Stitching backend is running."
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
