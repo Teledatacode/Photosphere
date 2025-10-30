@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+bien, este es mi script de stitching: from flask import Flask, request, jsonify
 import cv2
 import numpy as np
 import base64
@@ -11,9 +11,9 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
+# URL de tu Worker que ya maneja uploads
 CLOUDFLARE_UPLOAD_URL = "https://traveler-publications-worker.legendary24000.workers.dev/upload"
 
-# --- Helpers ---
 def base64_to_cv2image(b64):
     try:
         header, encoded = b64.split(',', 1)
@@ -24,50 +24,25 @@ def base64_to_cv2image(b64):
         print("Error decoding base64:", e)
         return None
 
-def is_image_valid(img, threshold=10):
-    """Descarta imágenes casi blancas o sin textura"""
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    variance = gray.var()
-    return variance > threshold
-
-def preprocess_image(img):
-    """Mejora contraste y textura para mejor stitching"""
-    try:
-        img = cv2.detailEnhance(img, sigma_s=10, sigma_r=0.15)
-    except Exception as e:
-        print("⚠️ Error en detailEnhance:", e)
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    gray = cv2.equalizeHist(gray)
-    return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-
-# --- Routes ---
 @app.route("/upload", methods=["POST"])
 def upload():
     data = request.get_json()
+
     if not data or "photos" not in data:
         return jsonify({"error": "No photos provided"}), 400
 
     images = []
     for item in data["photos"]:
         img = base64_to_cv2image(item["photo"])
-        if img is not None and is_image_valid(img):
-            img = preprocess_image(img)
+        if img is not None:
             images.append(img)
 
     if len(images) < 2:
-        return jsonify({"error": "Not enough valid images for stitching"}), 400
+        return jsonify({"error": "Need at least 2 valid images for stitching"}), 400
 
-    print(f"🧵 Procesando stitching con {len(images)} imágenes...")
-
-    # --- Stitching ---
-    stitcher = cv2.Stitcher_create(cv2.Stitcher_PANORAMA)
+    print("🧵 Procesando stitching...")
+    stitcher = cv2.Stitcher_create()
     status, stitched = stitcher.stitch(images)
-
-    # Fallback SCANS si PANORAMA falla
-    if status != cv2.Stitcher_OK:
-        print("⚠️ PANORAMA failed, intentando SCANS...")
-        stitcher = cv2.Stitcher_create(cv2.Stitcher_SCANS)
-        status, stitched = stitcher.stitch(images)
 
     if status != cv2.Stitcher_OK:
         print("❌ Falló el stitching:", status)
@@ -75,11 +50,13 @@ def upload():
 
     print("✅ Stitching completo, preparando envío a Cloudflare...")
 
+    # Convertir imagen resultante a bytes JPG
     _, buffer = cv2.imencode('.jpg', stitched)
     image_bytes = BytesIO(buffer.tobytes())
 
-    # --- Enviar a Cloudflare ---
+    # Enviar al Worker Cloudflare como FormData
     try:
+        # Recibir metadatos opcionales (token, etc.)
         token = data.get("token", "")
         description = data.get("description", "")
         user_name = data.get("userName", "Traveler")
@@ -123,3 +100,4 @@ def index():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
